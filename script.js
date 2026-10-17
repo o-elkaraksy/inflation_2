@@ -1,0 +1,226 @@
+(() => {
+"use strict";
+const DATA_URL = "https://raw.githubusercontent.com/o-elkaraksy/Inflation_dashboard_OCT2026/refs/heads/main/dashboard_data.csv";
+const COLORS = ["#477D75","#D89B68","#6C8FB3","#B07A83","#8D9B70","#8D83B8","#C5B28C","#679D9A","#B27D52","#8195A8","#A5A9A0","#9E8CBA"];
+const ICONS = ["utensils","cigarette","shirt","house","sofa","heart-pulse","bus","wifi","graduation-cap","coffee","landmark","package"];
+const $ = id => document.getElementById(id);
+const state = {rows:[], dates:[], dateKeys:[], latestIndex:-1, weightsChart:null, contributionChart:null, historyChart:null, headlineYoYChart:null, headlineMoMChart:null, historyCategory:null, historyRange:12, contributionRange:12, expanded:new Set(), historySelected:[], colors:{}};
+const fmt = n => Number.isFinite(n) ? `${n.toFixed(1)}%` : "—";
+const pp = n => Number.isFinite(n) ? `${n.toFixed(1)} pp` : "—";
+const num = v => { if(v===null||v===undefined||String(v).trim()==="") return null; const n=Number(String(v).replace(/,/g,"")); return Number.isFinite(n)?n:null; };
+const escapeHtml = s => String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function toast(message){const el=$("toast");el.textContent=message;el.classList.add("show");setTimeout(()=>el.classList.remove("show"),2800);}
+function parseDate(label){const m=String(label).match(/^([A-Za-z]{3})-(\d{2}|\d{4})$/);if(!m)return null;const months={Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};let y=Number(m[2]);if(y<100)y+=2000;return new Date(y,months[m[1]],1);}
+function monthLabel(d){return d.toLocaleDateString("en-GB",{month:"short",year:"numeric"});}
+function indexFor(row,idx){return row.values[idx]??null;}
+function inflation(row,idx,period){const back=period==="yoy"?12:1;if(idx<back)return null;const a=indexFor(row,idx),b=indexFor(row,idx-back);if(a===null||b===null||b===0)return null;return (a/b-1)*100;}
+function rowKind(row){const s=String(row.family||"").toLowerCase().trim();if(String(row.name||"").trim().toLowerCase()==="all items")return "all";if(s.startsWith("main category"))return "main";if(s.startsWith("sub category"))return "sub";if(s.startsWith("sub item"))return "item";return "other";}
+function rowOrder(row){const m=String(row.family||"").match(/(\d+(?:\.\d+)?)/);return m?Number(m[1]):999;}
+function normalizeRow(row){return {...row,kind:rowKind(row),order:rowOrder(row),weight:num(row.weight),subWeight:num(row.subWeight),values:row.values};}
+function hierarchyCode(row){const m=String(row.family||"").match(/(\d+(?:\.\d+)*)/);return m?m[1]:String(row.order);}
+function parentKey(row){const parts=hierarchyCode(row).split(".");if(row.kind==="sub")return parts[0];if(row.kind==="item")return parts.slice(0,2).join(".");return null;}
+function getMainRows(){return state.rows.filter(r=>r.kind==="main"&&String(r.name).trim().toLowerCase()!=="all items");}
+function getAllRow(){return state.rows.find(r=>r.kind==="all")||state.rows.find(r=>r.name.toLowerCase()==="all items");}
+function getChildren(main){return state.rows.filter(r=>(r.kind==="sub"||r.kind==="item")&&hierarchyCode(r).startsWith(hierarchyCode(main)+".")&&hierarchyCode(r).split(".").length===hierarchyCode(main).split(".").length+1);}
+function getDescendants(main){const prefix=hierarchyCode(main)+".";return state.rows.filter(r=>(r.kind==="sub"||r.kind==="item")&&hierarchyCode(r).startsWith(prefix));}
+function getChildRows(main){
+ // For contributions use leaf sub-items only; exclude intermediate subcategory aggregates.
+ return getDescendants(main).filter(r=>r.kind==="item");
+}
+function getItemsWithin(parent){const p=String(parent.order);if(parent.kind==="main")return state.rows.filter(r=>(r.kind==="sub"||r.kind==="item")&&parentKey(r)===p);if(parent.kind==="sub")return state.rows.filter(r=>r.kind==="item"&&String(r.order).split(".")[0]===p.split(".")[0]&&String(r.order).split(".").slice(0,2).join(".")===p);return [];}
+function aggregateRow(){return getAllRow();}
+function categoryIcon(i){return ICONS[i%ICONS.length];}
+function setStatus(text,ok=true){$("dataStatus").textContent=text;const dot=document.querySelector(".live-dot");if(dot)dot.style.background=ok?"#2ca782":"#c45151";}
+function rate(row,period,idx=state.latestIndex){return inflation(row,idx,period);}
+function previousValidRate(row,period,idx=state.latestIndex){return idx>0?inflation(row,idx-1,period):null;}
+function changeChip(current,previous){if(!Number.isFinite(current)||!Number.isFinite(previous))return "—";const d=current-previous;return `${d>0?"+":""}${d.toFixed(1)} pp`;}
+function setChange(id,current,previous){const el=$(id);el.textContent=changeChip(current,previous);el.classList.toggle("negative",Number.isFinite(current)&&Number.isFinite(previous)&&current<previous);}
+function contributionRaw(rows,period,idx){
+ const all=aggregateRow(),back=period==="yoy"?12:1;
+ if(idx<back||!all)return {agg:rate(all,period,idx),items:[]};
+ const previousAll=indexFor(all,idx-back),agg=rate(all,period,idx);
+ if(previousAll===null||previousAll===0)return {agg,items:[]};
+ const items=rows.map(row=>{
+  const current=indexFor(row,idx),previous=indexFor(row,idx-back),weight=Math.max(0,row.weight??0);
+  const contribution=current===null||previous===null?null:weight*(current-previous)/previousAll;
+  return {row,r:inflation(row,idx,period),w:weight,contribution};
+ }).filter(x=>x.contribution!==null&&Number.isFinite(x.contribution));
+ return {agg,items};
+}
+function getMainContribution(rows,period,idx){return contributionRaw(rows,period,idx);}
+function childContribution(parent,rows,period,idx){
+ const back=period==="yoy"?12:1,agg=rate(parent,period,idx);
+ if(idx<back)return {agg,items:[]};
+ const base=indexFor(parent,idx-back);
+ if(base===null||base===0)return {agg,items:[]};
+ const items=rows.map(row=>{
+  const current=indexFor(row,idx),previous=indexFor(row,idx-back),weight=Math.max(0,row.subWeight??0);
+  const contribution=current===null||previous===null?null:weight*(current-previous)/base;
+  return {row,r:inflation(row,idx,period),w:weight,contribution};
+ }).filter(x=>x.contribution!==null&&Number.isFinite(x.contribution));
+ return {agg,items};
+}
+function populateOverview(){
+ const all=aggregateRow();if(!all)return;
+ const yoy=rate(all,"yoy"),mom=rate(all,"mom"),py=previousValidRate(all,"yoy"),pm=previousValidRate(all,"mom");
+ $("headlineYoY").textContent=fmt(yoy);$("headlineMoM").textContent=fmt(mom);
+ $("headlineYoYPrev").textContent=`Previous month: ${fmt(py)}`;$("headlineMoMPrev").textContent=`Previous month: ${fmt(pm)}`;
+ setChange("headlineYoYChange",yoy,py);setChange("headlineMoMChange",mom,pm);
+ $("latestMonth").textContent=monthLabel(state.dates[state.latestIndex]);
+ const mains=getMainRows();
+ for(const period of ["yoy","mom"]){const c=getMainContribution(mains,period,state.latestIndex);const top=[...c.items].sort((a,b)=>b.contribution-a.contribution)[0];const nameId=period==="yoy"?"topYoYName":"topMoMName",valId=period==="yoy"?"topYoYValue":"topMoMValue";$(nameId).textContent=top?top.row.name:"—";let avg="—";if(top){const vals=[];for(let j=Math.max(period==="yoy"?12:1,state.latestIndex-5);j<=state.latestIndex;j++){const v=getMainContribution(mains,period,j).items.find(x=>x.row.family===top.row.family)?.contribution;if(Number.isFinite(v))vals.push(v*100);}if(vals.length)avg=pp(vals.reduce((a,b)=>a+b,0)/vals.length);}$(valId).textContent=top?`${pp(top.contribution*100)} latest · ${avg} avg. 6m`:"—";}
+}
+function clearTooltipOnExit(canvas, getChart){
+ if(!canvas || canvas.dataset.tooltipClearBound==="1")return;
+ canvas.dataset.tooltipClearBound="1";
+ const clear=()=>{const chart=getChart();if(chart){chart.tooltip.setActiveElements([], {x:0,y:0});chart.update("none");}};
+ canvas.addEventListener("mouseleave",clear);canvas.addEventListener("pointerleave",clear);canvas.addEventListener("touchend",clear,{passive:true});
+}
+function buildHeadlineHistoryCharts(){
+ const all=aggregateRow();if(!all)return;
+ const start=Math.min(12,state.latestIndex),labels=state.dates.slice(start,state.latestIndex+1).map(monthLabel);
+ const build=(id,period,color)=>{const key=period==="yoy"?"headlineYoYChart":"headlineMoMChart";if(state[key])state[key].destroy();state[key]=new Chart($(id),{type:"line",data:{labels,datasets:[{label:period==="yoy"?"Headline YoY inflation":"Headline MoM inflation",data:state.dates.slice(start,state.latestIndex+1).map((_,o)=>rate(all,period,start+o)),borderColor:color,backgroundColor:color,borderWidth:2.5,pointRadius:labels.length>36?0:2.5,pointHoverRadius:4,tension:.25,spanGaps:false}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"nearest",intersect:true},events:["mousemove","mouseout","click","touchstart","touchmove"],plugins:{legend:{display:false},tooltip:{mode:"nearest",intersect:true,callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.raw)}`}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:8,maxRotation:0,color:"#77859a",font:{size:10}}},y:{title:{display:true,text:period==="yoy"?"YoY inflation (%)":"MoM inflation (%)",color:"#77859a",font:{size:10}},grid:{color:"#edf1f6"},ticks:{color:"#77859a",callback:v=>Number(v).toFixed(1)+"%"}}}}});
+   clearTooltipOnExit($(id),()=>state[key]);};
+ build("headlineYoYChart","yoy","#00529b");build("headlineMoMChart","mom","#f58220");
+}
+function buildWeightChart(){
+ const mains=getMainRows().slice().sort((a,b)=>(b.weight||0)-(a.weight||0));
+ const ctx=$("weightsChart").getContext("2d");if(state.weightsChart)state.weightsChart.destroy();
+ state.weightsChart=new Chart(ctx,{type:"doughnut",data:{labels:mains.map(r=>r.name),datasets:[{data:mains.map(r=>r.weight||0),backgroundColor:mains.map((r,i)=>COLORS[i%COLORS.length]),borderColor:"#fff",borderWidth:3,hoverOffset:8}]},options:{responsive:true,maintainAspectRatio:false,cutout:"65%",plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${c.label}: ${(Number(c.raw)*100).toFixed(1)}%`}}}}});
+ $("weightsLegend").innerHTML=mains.map((r,i)=>`<div class="legend-item"><span class="legend-dot" style="background:${COLORS[i%COLORS.length]}"></span><span class="legend-name">${escapeHtml(r.name)}</span><span class="legend-weight">${((r.weight||0)*100).toFixed(1)}%</span></div>`).join("");
+}
+function categoryCardHtml(row,i){
+ const y=rate(row,"yoy"),m=rate(row,"mom"),children=getChildRows(row),expanded=state.expanded.has(row.family);
+ const details=expanded?detailHtml(row):"";
+ return `<article class="category-card ${expanded?"expanded":""}" data-family="${escapeHtml(row.family)}">
+ <div class="category-top" role="button" tabindex="0" aria-expanded="${expanded}" data-expand="${escapeHtml(row.family)}">
+ <div class="category-title-row"><div class="category-name">${escapeHtml(row.name)}</div><div class="category-weight">${((row.weight||0)*100).toFixed(1)}% weight</div></div>
+ <div class="category-metrics"><div class="category-metric"><strong>${fmt(y)}</strong><span>Annual · YoY</span></div><div class="category-metric"><strong>${fmt(m)}</strong><span>Monthly · MoM</span></div></div></div>
+ <div class="category-card-actions"><button class="history-button" data-history="${escapeHtml(row.family)}"><i data-lucide="chart-no-axes-combined"></i> Historical</button><span class="expand-hint" data-expand="${escapeHtml(row.family)}">${expanded?"Hide details":"Explore components"} <i data-lucide="chevron-down"></i></span></div>
+ ${details}</article>`;
+}
+function detailHtml(main){
+ const children=getDescendants(main).filter(r=>r.kind==="sub"||r.kind==="item");if(!children.length)return `<div class="category-details"><p class="section-note">No child rows were found for this category.</p></div>`;
+ const sortKey=state[`sort_${main.family}`]||"source";
+ const compare=(a,b)=>{if(sortKey==="yoy-desc")return (rate(b,"yoy")??-Infinity)-(rate(a,"yoy")??-Infinity);if(sortKey==="yoy-asc")return (rate(a,"yoy")??Infinity)-(rate(b,"yoy")??Infinity);if(sortKey==="mom-desc")return (rate(b,"mom")??-Infinity)-(rate(a,"mom")??-Infinity);if(sortKey==="mom-asc")return (rate(a,"mom")??Infinity)-(rate(b,"mom")??Infinity);if(sortKey==="weight-desc")return (b.weight||0)-(a.weight||0);return a.order-b.order;};
+ // Preserve each subcategory as a fixed group header; only sort siblings within that group.
+ let sorted=[];
+ if(main.kind==="main"){
+   const subs=children.filter(r=>r.kind==="sub").sort((a,b)=>a.order-b.order);
+   if(subs.length){for(const sub of subs){sorted.push(sub);const items=children.filter(r=>r.kind==="item"&&parentKey(r)===hierarchyCode(sub)).sort(compare);sorted.push(...items);}}
+   else sorted=children.slice().sort(compare);
+ } else sorted=children.slice().sort(compare);
+ return `<div class="category-details"><div class="detail-toolbar"><label>${children.length} components</label><select aria-label="Sort components" data-detail-sort="${escapeHtml(main.family)}"><option value="source" ${sortKey==="source"?"selected":""}>Source order</option><option value="yoy-desc" ${sortKey==="yoy-desc"?"selected":""}>YoY · high to low</option><option value="yoy-asc" ${sortKey==="yoy-asc"?"selected":""}>YoY · low to high</option><option value="mom-desc" ${sortKey==="mom-desc"?"selected":""}>MoM · high to low</option><option value="mom-asc" ${sortKey==="mom-asc"?"selected":""}>MoM · low to high</option><option value="weight-desc" ${sortKey==="weight-desc"?"selected":""}>Weight · high to low</option></select></div>
+ <div class="detail-table-wrap"><table class="detail-table"><thead><tr><th>Category / item</th><th>YoY</th><th>MoM</th></tr></thead><tbody>${sorted.map(r=>`<tr class="${r.kind==="sub"?"subcategory-row":"subitem-row"}"><td>${r.kind==="item"?"↳ ":""}${escapeHtml(r.name)}</td><td class="${(rate(r,"yoy")??0)<0?"negative-value":"positive-value"}">${fmt(rate(r,"yoy"))}</td><td class="${(rate(r,"mom")??0)<0?"negative-value":"positive-value"}">${fmt(rate(r,"mom"))}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+function renderCategories(){
+ const mains=getMainRows();const sort=$("categorySort").value||"source";const sorted=mains.slice().sort((a,b)=>{if(sort==="yoy-desc")return (rate(b,"yoy")??-Infinity)-(rate(a,"yoy")??-Infinity);if(sort==="yoy-asc")return (rate(a,"yoy")??Infinity)-(rate(b,"yoy")??Infinity);if(sort==="mom-desc")return (rate(b,"mom")??-Infinity)-(rate(a,"mom")??-Infinity);if(sort==="mom-asc")return (rate(a,"mom")??Infinity)-(rate(b,"mom")??Infinity);if(sort==="weight-desc")return (b.weight||0)-(a.weight||0);return a.order-b.order;});
+ $("categoryGrid").innerHTML=sorted.map((r,i)=>categoryCardHtml(r,i)).join("");bindCategoryEvents();if(window.lucide)lucide.createIcons();
+}
+function bindCategoryEvents(){
+ document.querySelectorAll("[data-expand]").forEach(el=>{el.addEventListener("click",e=>{if(e.target.closest("[data-history]"))return;toggleExpanded(el.dataset.expand);});if(el.classList.contains("category-top"))el.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggleExpanded(el.dataset.expand);}});});
+ document.querySelectorAll("[data-detail-sort]").forEach(el=>el.addEventListener("change",()=>{state[`sort_${el.dataset.detailSort}`]=el.value;renderCategories();state.expanded.add(el.dataset.detailSort);renderCategories();}));
+ document.querySelectorAll("[data-history]").forEach(el=>el.addEventListener("click",e=>{e.stopPropagation();const row=state.rows.find(r=>r.family===el.dataset.history);if(row)openHistory(row);}));
+}
+function toggleExpanded(key){if(state.expanded.has(key))state.expanded.delete(key);else state.expanded.add(key);renderCategories();}
+function populateParentSelect(){
+ const mains=getMainRows().filter(r=>/food and non-alcoholic beverages|housing, water, electricity, gas and other fuels/i.test(r.name));$("parentSelect").innerHTML=mains.map(r=>`<option value="${escapeHtml(r.family)}">${escapeHtml(r.name)}</option>`).join("");
+ $("parentSelectWrap").classList.toggle("hidden",$("contributionLevel").value==="main");
+}
+function selectedContributionRows(idx){
+ const level=$("contributionLevel").value;
+ if(level==="main")return {rows:getMainRows(),parent:null,aggregate:aggregateRow()};
+ const allowed=getMainRows().filter(r=>/food and non-alcoholic beverages|housing, water, electricity, gas and other fuels/i.test(r.name));const parent=allowed.find(r=>r.family===$("parentSelect").value)||allowed[0]||getMainRows()[0];
+ return {rows:getChildRows(parent),parent,aggregate:parent};
+}
+function currentRange(range,idx=state.latestIndex){if(range==="all")return Math.min(12,idx);return Math.max(0,idx-Number(range)+1);}
+function contributionTopLabelsPlugin(){return {id:"contributionTopLabels",afterDatasetsDraw(chart){
+ const {ctx,scales:{x,y}}=chart;if(!x||!y)return;
+ const labels=chart.$topInflationLabels||[];const allMode=chart.$allRange===true;ctx.save();ctx.font="600 10px DM Sans, sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.fillStyle="#43556b";
+ labels.forEach((label,i)=>{if(label===null||label===undefined)return;if(allMode&&i%2===1)return;const xPos=x.getPixelForValue(i);let total=0;chart.data.datasets.forEach(ds=>{const v=Number(ds.data[i]);if(Number.isFinite(v)&&v>0)total+=v;});const yPos=y.getPixelForValue(total);if(Number.isFinite(xPos)&&Number.isFinite(yPos))ctx.fillText(`${Number(label).toFixed(1)}%`,xPos,yPos-4);});ctx.restore();
+}}}
+function renderContribution(){
+ if(!state.rows.length)return;
+ const period=$("contributionMeasure").value,level=$("contributionLevel").value;
+ $("parentSelectWrap").classList.toggle("hidden",level==="main");
+ const selection=selectedContributionRows(),rows=selection.rows,start=currentRange(state.contributionRange);
+ const labels=state.dates.slice(start,state.latestIndex+1).map(monthLabel),mainLevel=level==="main",totalRow=selection.aggregate;
+ const totalValues=[],rawByRow=rows.map(r=>({row:r,data:[]}));
+ for(let idx=start;idx<=state.latestIndex;idx++){
+  totalValues.push(rate(totalRow,period,idx));
+  const result=mainLevel?getMainContribution(rows,period,idx):childContribution(selection.parent,rows,period,idx);
+  const byRow=new Map(result.items.map(x=>[x.row,x.contribution*100]));
+  rawByRow.forEach(x=>x.data.push(byRow.has(x.row)?byRow.get(x.row):null));
+ }
+ // A stable series order based on the latest month keeps the largest contributor at the bottom.
+ const ordered=rawByRow.map((item,i)=>({item,i,v:item.data[item.data.length-1]??-Infinity})).sort((a,b)=>a.v-b.v);
+ const palette=["#3F7C78","#D5A46C","#7196B7","#B97F88","#8D9F79","#9A8BB9","#C6B38D","#5C9F9A","#B57F58","#8195A8","#A7AAA1","#A68DB6"];
+ const datasets=ordered.map(({item,i})=>({type:"bar",label:item.row.name,data:item.data,backgroundColor:palette[i%palette.length],borderColor:"rgba(255,255,255,.8)",borderWidth:1,borderRadius:5,borderSkipped:false,stack:"contrib",barPercentage:.82,categoryPercentage:.78}));
+ if(state.contributionChart)state.contributionChart.destroy();
+ state.contributionChart=new Chart($("contributionChart"),{type:"bar",data:{labels,datasets},plugins:[contributionTopLabelsPlugin()],options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"nearest",intersect:true},events:["mousemove","mouseout","click","touchstart","touchmove"],plugins:{legend:{display:false},tooltip:{mode:"nearest",intersect:true,displayColors:true,backgroundColor:"rgba(36,49,65,.96)",padding:9,cornerRadius:7,callbacks:{title:items=>items[0]?.label||"",label:c=>`${c.dataset.label}: ${Number.isFinite(c.raw)?c.raw.toFixed(2)+" pp":"—"}`}}},layout:{padding:{top:24}},scales:{x:{stacked:true,grid:{display:false},ticks:{maxTicksLimit:10,maxRotation:0,color:"#77859a",font:{size:10}}},y:{stacked:true,title:{display:true,text:"Contribution (percentage points)",color:"#77859a",font:{size:10}},grid:{color:"#e8edf3"},ticks:{color:"#77859a",font:{size:10},callback:v=>Number(v).toFixed(1)}}}}});
+ state.contributionChart.$topInflationLabels=totalValues;state.contributionChart.$allRange=state.contributionRange==="all";state.contributionChart.update("none");
+ clearTooltipOnExit($("contributionChart"),()=>state.contributionChart);
+ $("rangeLabel").textContent=`${labels[0]||"—"} – ${labels[labels.length-1]||"—"}`;
+ $("contributionNote").textContent=mainLevel?"Bars show each main category's contribution to headline inflation in percentage points. Labels above columns show overall inflation. For all data, labels are shown every other month to reduce clutter; calculations use the original index-change and rebased-weight formulas without proportional reconciliation.":`Bars show sub-item contributions in percentage points for ${selection.parent.name}. Labels above columns show that category's overall inflation. For all data, labels are shown every other month to reduce clutter.`;
+}
+function openHistory(row){
+ state.historyCategory=row;state.historyRange=12;state.historySelected=[];
+ $("historyTitle").textContent=row.name;$("historySubtitle").textContent=`${((row.weight||0)*100).toFixed(1)}% basket weight · choose additional components to compare`;
+ const descendants=[];
+ const hi=$("historyItems");if(hi)hi.innerHTML="";
+ $("historyModal").classList.remove("hidden");document.body.style.overflow="hidden";document.querySelectorAll(".history-ranges button").forEach(b=>b.classList.toggle("active",b.dataset.range==="12"));renderHistory();if(window.lucide)lucide.createIcons();
+}
+function closeHistory(){$("historyModal").classList.add("hidden");document.body.style.overflow="";}
+function renderHistory(){
+ const row=state.historyCategory;if(!row)return;const period=$("historyMeasure").value,start=currentRange(state.historyRange);
+ const labels=state.dates.slice(start,state.latestIndex+1).map(monthLabel);
+ const series=[row];
+ const datasets=series.map((r,i)=>({label:r.name,data:state.dates.slice(start,state.latestIndex+1).map((_,offset)=>rate(r,period,start+offset)),borderColor:"#477D75",backgroundColor:"transparent",borderWidth:i===0?2.8:2,pointRadius:labels.length>36?0:2,tension:.25,spanGaps:false}));
+ if(state.historyChart)state.historyChart.destroy();
+ state.historyChart=new Chart($("historyChart"),{type:"line",data:{labels,datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"nearest",intersect:true},events:["mousemove","mouseout","click","touchstart","touchmove"],plugins:{legend:{position:"bottom",labels:{usePointStyle:true,boxWidth:8,padding:14,font:{size:10}}},tooltip:{mode:"nearest",intersect:true,callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.raw)}`}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10,maxRotation:0,color:"#77859a",font:{size:10}}},y:{title:{display:true,text:period==="yoy"?"YoY inflation (%)":"MoM inflation (%)",color:"#77859a",font:{size:10}},grid:{color:"#edf1f6"},ticks:{color:"#77859a",callback:v=>Number(v).toFixed(1)+"%"}}}}});
+ clearTooltipOnExit($("historyChart"),()=>state.historyChart);
+ $("historyRangeLabel").textContent=`${labels[0]||"—"} – ${labels[labels.length-1]||"—"}`;
+}
+function parseCsv(text){
+ const parsed=Papa.parse(text,{header:true,skipEmptyLines:true,dynamicTyping:false});
+ if(parsed.errors.length)console.warn("CSV parsing warnings",parsed.errors);
+ const fields=parsed.meta.fields||[];const dateFields=fields.filter(f=>parseDate(f));
+ state.dates=dateFields.map(parseDate);state.dateKeys=dateFields;
+ state.rows=parsed.data.map(r=>normalizeRow({family:r["category family"],name:r["Category"],subWeight:num(r["sub  items weights"]??r["sub items weights"]),weight:num(r["Weights Rebased"]),values:dateFields.map(k=>num(r[k]))})).filter(r=>r.name);
+ state.latestIndex=state.dates.length-1;
+}
+async function loadData(){
+ setStatus("Fetching latest CSV…");
+ $("refreshBtn").disabled=true;
+ try{
+  const response=await fetch(DATA_URL,{cache:"no-store"});
+  if(!response.ok)throw new Error(`GitHub returned ${response.status}`);
+  const text=await response.text();parseCsv(text);
+  if(!state.rows.length||!state.dates.length)throw new Error("No valid CPI rows or monthly columns were found.");
+  populateOverview();buildHeadlineHistoryCharts();buildWeightChart();renderCategories();populateParentSelect();renderContribution();
+  $("updatedAt").textContent=`Source: GitHub CSV · loaded ${new Date().toLocaleString()}`;
+  setStatus(`${state.rows.length} series loaded`,true);
+ }catch(err){
+  console.error(err);setStatus("Data could not load",false);
+  $("categoryGrid").innerHTML=`<div class="error-card"><b>Unable to load the source CSV.</b><br>Check that the GitHub file is public and that the URL is correct, then refresh. ${escapeHtml(err.message)}</div>`;
+  toast("Could not fetch the CSV from GitHub.");
+ }finally{$("refreshBtn").disabled=false;if(window.lucide)lucide.createIcons();}
+}
+function bindGlobalEvents(){
+ $("refreshBtn").addEventListener("click",loadData);
+ $("weightsToggle").addEventListener("click",()=>{const panel=$("weightsPanel");const opening=panel.classList.contains("hidden");panel.classList.toggle("hidden");$("weightsToggle").querySelector("span").textContent=opening?"Hide weight breakdown":"Show weight breakdown";if(opening&&state.weightsChart)state.weightsChart.resize();});
+ $("categorySort").addEventListener("change",renderCategories);
+ $("contributionMeasure").addEventListener("change",renderContribution);
+ $("contributionLevel").addEventListener("change",()=>{populateParentSelect();renderContribution();});
+ $("parentSelect").addEventListener("change",renderContribution);
+ document.querySelectorAll(".range-buttons:not(.history-ranges) button").forEach(b=>b.addEventListener("click",()=>{state.contributionRange=b.dataset.range;document.querySelectorAll(".range-buttons:not(.history-ranges) button").forEach(x=>x.classList.toggle("active",x===b));renderContribution();}));
+ document.querySelectorAll(".history-ranges button").forEach(b=>b.addEventListener("click",()=>{state.historyRange=b.dataset.range;document.querySelectorAll(".history-ranges button").forEach(x=>x.classList.toggle("active",x===b));renderHistory();}));
+ const periodValues=["6","12","24","all"];const sliderValue=v=>periodValues.indexOf(String(v))+1;const setSlider=(id,range)=>{const el=$(id);if(el)el.value=sliderValue(range);};
+ const hslider=$("historyRangeSlider");if(hslider)hslider.addEventListener("input",()=>{state.historyRange=periodValues[Number(hslider.value)-1];document.querySelectorAll(".history-ranges button").forEach(x=>x.classList.toggle("active",x.dataset.range===String(state.historyRange)));renderHistory();});
+ document.querySelectorAll(".history-ranges button").forEach(b=>b.addEventListener("click",()=>setSlider("historyRangeSlider",b.dataset.range)));
+ $("historyMeasure").addEventListener("change",renderHistory);
+ document.querySelectorAll("[data-close-modal]").forEach(el=>el.addEventListener("click",closeHistory));
+ document.addEventListener("keydown",e=>{if(e.key==="Escape"&& !$("historyModal").classList.contains("hidden"))closeHistory();});
+}
+bindGlobalEvents();loadData();
+})();
